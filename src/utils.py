@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     "results_folder": "results",
     "prompt_per_category": 3,
     "prompt_sample_seed": 42,
-    "single_prompt_per_seed": True,
+    "single_prompt_per_seed": False,
     "num_generations": 100,
     "pop_size": 20,
     "cmaes_variant": "sep",
@@ -891,3 +891,167 @@ def aggregate_results(output_folder: str | Path):
     )
     method_summary.to_csv(output_folder / "aggregate_method_summary.csv")
     return summary
+
+
+def _load_method_run_series(run_dir: Path):
+    config_path = run_dir / "config.json"
+    run_config = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as handle:
+            run_config = json.load(handle)
+
+    if (run_dir / "fitness_results.csv").exists():
+        df = pd.read_csv(run_dir / "fitness_results.csv").sort_values("generation")
+        steps = pd.to_numeric(df["generation"], errors="coerce").to_numpy(dtype=float)
+        return {
+            "method": "sepcmaes",
+            "time_limit_seconds": run_config.get("time_limit_seconds"),
+            "time": pd.to_numeric(df["elapsed_time"], errors="coerce").to_numpy(dtype=float),
+            "step": steps,
+            "aesthetic": pd.to_numeric(df["max_aesthetic_score"], errors="coerce").to_numpy(dtype=float),
+            "clip": pd.to_numeric(df["max_clip_score"], errors="coerce").to_numpy(dtype=float),
+            "objective": pd.to_numeric(df["max_fitness"], errors="coerce").to_numpy(dtype=float),
+        }
+
+    if (run_dir / "score_results.csv").exists():
+        df = pd.read_csv(run_dir / "score_results.csv").sort_values("iteration")
+        steps = pd.to_numeric(df["iteration"], errors="coerce").to_numpy(dtype=float)
+        return {
+            "method": "adam",
+            "time_limit_seconds": run_config.get("time_limit_seconds"),
+            "time": pd.to_numeric(df["elapsed_time"], errors="coerce").to_numpy(dtype=float),
+            "step": steps,
+            "aesthetic": pd.to_numeric(df["aesthetic_score"], errors="coerce").to_numpy(dtype=float),
+            "clip": pd.to_numeric(df["clip_score"], errors="coerce").to_numpy(dtype=float),
+            "objective": pd.to_numeric(df["combined_score"], errors="coerce").to_numpy(dtype=float),
+        }
+
+    return None
+
+
+def _interpolate_metric_on_axis(series_list, metric_name: str, axis_name: str, axis_values: np.ndarray):
+    rows = []
+    for series in series_list:
+        source_axis = np.asarray(series[axis_name], dtype=float)
+        metric_values = np.asarray(series[metric_name], dtype=float)
+        valid = np.isfinite(source_axis) & np.isfinite(metric_values)
+        if valid.sum() == 0:
+            continue
+        source_axis = source_axis[valid]
+        metric_values = metric_values[valid]
+        order = np.argsort(source_axis)
+        source_axis = source_axis[order]
+        metric_values = metric_values[order]
+        unique_axis, unique_idx = np.unique(source_axis, return_index=True)
+        metric_values = metric_values[unique_idx]
+        if unique_axis.size == 1:
+            interpolated = np.full_like(axis_values, np.nan, dtype=float)
+            interpolated[axis_values == unique_axis[0]] = metric_values[0]
+        else:
+            interpolated = np.interp(axis_values, unique_axis, metric_values, left=np.nan, right=np.nan)
+            mask = (axis_values >= unique_axis.min()) & (axis_values <= unique_axis.max())
+            interpolated = np.where(mask, interpolated, np.nan)
+        rows.append(interpolated)
+    if not rows:
+        return np.empty((0, len(axis_values)), dtype=float)
+    return np.asarray(rows, dtype=float)
+
+
+def _plot_method_comparison(
+    metric_name: str,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+    axis_values: np.ndarray,
+    axis_name: str,
+    axis_label: str,
+    grouped_series: dict,
+):
+    plt.figure(figsize=(10, 6))
+    for method, series_list in grouped_series.items():
+        values = _interpolate_metric_on_axis(series_list, metric_name, axis_name, axis_values)
+        if values.size == 0:
+            continue
+        mean_values = np.nanmean(values, axis=0)
+        std_values = np.nanstd(values, axis=0)
+        lower = mean_values - std_values
+        upper = mean_values + std_values
+        label = "sep-CMA-ES" if method == "sepcmaes" else method.upper()
+        plt.plot(axis_values, mean_values, label=label)
+        plt.fill_between(axis_values, lower, upper, alpha=0.2)
+
+    plt.xlabel(axis_label)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid()
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def create_method_comparison_plots(output_folder: str | Path, num_points: int = 200):
+    output_folder = Path(output_folder)
+    grouped_series = defaultdict(list)
+    for run_dir in _find_result_dirs(output_folder):
+        series = _load_method_run_series(run_dir)
+        if series is None:
+            continue
+        grouped_series[series["method"]].append(series)
+
+    if not grouped_series:
+        return {}
+
+    use_progress_axis = all(
+        series.get("time_limit_seconds") is None
+        for series_list in grouped_series.values()
+        for series in series_list
+    )
+
+    if use_progress_axis:
+        min_num_points = min(
+            len(np.asarray(series["step"], dtype=float))
+            for series_list in grouped_series.values()
+            for series in series_list
+            if len(np.asarray(series["step"], dtype=float)) > 0
+        )
+        num_axis_points = max(2, min(int(min_num_points), int(num_points)))
+        axis_values = np.linspace(0.0, 100.0, num_axis_points)
+        axis_name = "progress"
+        axis_label = "Iterations (%)"
+        for series_list in grouped_series.values():
+            for series in series_list:
+                step_values = np.asarray(series["step"], dtype=float)
+                valid = np.isfinite(step_values)
+                if valid.sum() == 0:
+                    series["progress"] = np.array([], dtype=float)
+                    continue
+                step_values = step_values[valid]
+                max_step = float(np.nanmax(step_values))
+                if max_step <= 0:
+                    series["progress"] = np.zeros_like(step_values, dtype=float)
+                else:
+                    series["progress"] = 100.0 * step_values / max_step
+    else:
+        max_time = max(
+            float(np.nanmax(np.asarray(series["time"], dtype=float)))
+            for series_list in grouped_series.values()
+            for series in series_list
+        )
+        axis_values = np.linspace(0.0, max_time, num_points) if max_time > 0 else np.array([0.0], dtype=float)
+        axis_name = "time"
+        axis_label = "Elapsed time (s)"
+
+    plot_specs = {
+        "aesthetic_comparison.png": ("aesthetic", "Aesthetic score", "Aesthetic Score Evolution by Method"),
+        "clip_comparison.png": ("clip", "CLIP score", "CLIP Score Evolution by Method"),
+        "objective_comparison.png": ("objective", "Combined objective", "Combined Objective Evolution by Method"),
+    }
+
+    output_paths = {}
+    for filename, (metric_name, ylabel, title) in plot_specs.items():
+        output_path = output_folder / filename
+        _plot_method_comparison(metric_name, ylabel, title, output_path, axis_values, axis_name, axis_label, grouped_series)
+        output_paths[metric_name] = str(output_path)
+
+    return output_paths
